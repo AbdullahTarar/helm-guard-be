@@ -1,19 +1,28 @@
 package server
 
 import (
-	"context"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
-	"strings"
+	"path/filepath"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
-	"github.com/AbdullahTarar/helm-guard-be/internal/config"
-	"helm-scanner/internal/github"
-	"helm-scanner/internal/helm"
+	"golang.org/x/oauth2"
+
+	"helm-guard-be/internal/config"
+	"helm-guard-be/internal/github"
+	"helm-guard-be/internal/helm"
 )
+
+func init() {
+	// Required to store these types in sessions
+	gob.Register(&oauth2.Token{})
+	gob.Register(map[string]interface{}{})
+}
 
 type Server struct {
 	router      *mux.Router
@@ -24,12 +33,15 @@ type Server struct {
 }
 
 func New(cfg *config.Config) (*Server, error) {
-	// Initialize GitHub client
-	ghClient := github.NewClient(
-		cfg.GitHub.ClientID,
-		cfg.GitHub.ClientSecret,
-		cfg.GitHub.RedirectURI,
-	)
+	// Create session store
+	store := sessions.NewCookieStore([]byte(cfg.Security.CookieSecret))
+	store.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   86400 * 1, // 1 day
+		HttpOnly: true,
+		Secure:   false, // Set to true in production
+		SameSite: http.SameSiteLaxMode,
+	}
 
 	// Initialize Helm scanner
 	helmScanner, err := helm.NewScanner(cfg.Helm.TempDir)
@@ -37,8 +49,11 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to initialize Helm scanner: %v", err)
 	}
 
-	// Initialize session store
-	store := sessions.NewCookieStore([]byte(cfg.Security.CookieSecret))
+	// Initialize GitHub client
+	ghClient := github.NewClient(cfg.GitHub.ClientID, cfg.GitHub.ClientSecret, cfg.GitHub.RedirectURI)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize GitHub client: %v", err)
+	}
 
 	// Create server
 	srv := &Server{
@@ -49,39 +64,37 @@ func New(cfg *config.Config) (*Server, error) {
 		store:       store,
 	}
 
-	// Setup routes
 	srv.routes()
-
 	return srv, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.router.ServeHTTP(w, r)
 }
+
 func (s *Server) routes() {
-    // Add CORS middleware
     s.router.Use(func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000") // Your frontend URL
+            w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
             w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
             w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
             w.Header().Set("Access-Control-Allow-Credentials", "true")
-            
+
             if r.Method == "OPTIONS" {
                 w.WriteHeader(http.StatusOK)
                 return
             }
-            
+
             next.ServeHTTP(w, r)
         })
     })
 
-    // Your existing routes
-    s.router.HandleFunc("/api/scan/public", s.handlePublicRepoScan).Methods("POST", "OPTIONS")
-    s.router.HandleFunc("/api/github/auth", s.handleGitHubAuth).Methods("GET")
-    s.router.HandleFunc("/api/github/callback", s.handleGitHubCallback).Methods("GET")
-    s.router.HandleFunc("/api/scan/private", s.handlePrivateRepoScan).Methods("POST", "OPTIONS")
-    s.router.HandleFunc("/api/scan/results/{id}", s.handleGetScanResults).Methods("GET")
+	s.router.HandleFunc("/api/scan/public", s.handlePublicRepoScan).Methods("POST", "OPTIONS")
+	s.router.HandleFunc("/api/github/auth", s.handleGitHubAuth).Methods("GET")
+	s.router.HandleFunc("/api/github/callback", s.handleGitHubCallback).Methods("GET")
+	s.router.HandleFunc("/api/scan/private", s.handlePrivateRepoScan).Methods("POST", "OPTIONS")
+	s.router.HandleFunc("/api/scan/results/{id}", s.handleGetScanResults).Methods("GET")
+	s.router.HandleFunc("/api/github/repos", s.handleGetUserRepos).Methods("GET", "OPTIONS")
 }
 
 func (s *Server) handlePublicRepoScan(w http.ResponseWriter, r *http.Request) {
@@ -95,41 +108,32 @@ func (s *Server) handlePublicRepoScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse GitHub URL
 	owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// For public repos, we can use the GitHub API without authentication
-	// Construct the download URL for the latest release or master branch
 	downloadURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/main.tar.gz", owner, repo)
 
-	// Download and extract the chart
 	chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// If a specific path is provided, use that
 	if req.Path != "" {
 		chartPath = filepath.Join(chartPath, req.Path)
 	}
 
-	// Analyze the chart
 	analysis, err := s.helmScanner.AnalyzeChart(chartPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Generate a result ID
 	resultID := uuid.New().String()
 
-	// Store the results (in a real app, you'd use a database)
-	// For now, we'll just return them
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":       resultID,
 		"results":  analysis,
@@ -140,59 +144,99 @@ func (s *Server) handlePublicRepoScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleGetUserRepos(w http.ResponseWriter, r *http.Request) {
+    session, err := s.store.Get(r, "helm-scanner-session")
+    if err != nil {
+        http.Error(w, "Session error", http.StatusUnauthorized)
+        return
+    }
+
+    token, ok := session.Values["github_token"].(*oauth2.Token)
+    if !ok {
+        http.Error(w, "Not authenticated", http.StatusUnauthorized)
+        return
+    }
+
+    ghClient := s.github.NewClientWithToken(token)
+    repos, err := s.github.GetUserRepos(r.Context(), ghClient)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    // Simplify repo data for frontend
+    var repoList []map[string]interface{}
+    for _, repo := range repos {
+        repoList = append(repoList, map[string]interface{}{
+            "name":        repo.GetName(),
+            "full_name":   repo.GetFullName(),
+            "private":     repo.GetPrivate(),
+            "html_url":    repo.GetHTMLURL(),
+            "description": repo.GetDescription(),
+        })
+    }
+
+    json.NewEncoder(w).Encode(repoList)
+}
+
+
 func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
-	// Generate a state token
 	state := uuid.New().String()
 
-	// Store the state in the session
-	session, _ := s.store.Get(r, "helm-scanner-session")
+	session, err := s.store.Get(r, "helm-scanner-session")
+	if err != nil {
+		log.Printf("Error getting session: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
 	session.Values["state"] = state
 	if err := session.Save(r, w); err != nil {
+		log.Printf("Error saving session: %v", err)
 		http.Error(w, "Failed to save session", http.StatusInternalServerError)
 		return
 	}
 
-	// Redirect to GitHub auth URL
 	authURL := s.github.GetAuthURL(state)
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
-	// Verify the state
-	session, _ := s.store.Get(r, "helm-scanner-session")
-	storedState, ok := session.Values["state"].(string)
-	if !ok {
-		http.Error(w, "Invalid session state", http.StatusBadRequest)
+	session, err := s.store.Get(r, "helm-scanner-session")
+	if err != nil {
+		log.Printf("Error getting session: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	queryState := r.URL.Query().Get("state")
-	if queryState != storedState {
+	storedState, ok := session.Values["state"].(string)
+	if !ok || r.URL.Query().Get("state") != storedState {
+		log.Println("Invalid or mismatched state")
 		http.Error(w, "State mismatch", http.StatusBadRequest)
 		return
 	}
 
-	// Exchange the code for a token
 	code := r.URL.Query().Get("code")
 	token, err := s.github.ExchangeCode(r.Context(), code)
 	if err != nil {
+		log.Printf("Failed to exchange token: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to exchange token: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Store the token in the session (in a real app, you'd associate this with a user)
 	session.Values["github_token"] = token
+	session.Values["authenticated"] = true
+
 	if err := session.Save(r, w); err != nil {
-		http.Error(w, "Failed to save session", http.StatusInternalServerError)
+		log.Printf("Failed to save session: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to save session: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Redirect back to the frontend
-	http.Redirect(w, r, "/?auth=success", http.StatusFound)
+	http.Redirect(w, r, "http://localhost:3000/?auth=success", http.StatusFound)
 }
 
 func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
-	// Get the GitHub token from the session
 	session, _ := s.store.Get(r, "helm-scanner-session")
 	token, ok := session.Values["github_token"].(*oauth2.Token)
 	if !ok {
@@ -211,20 +255,17 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse GitHub URL
 	owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Create authenticated GitHub client
 	ghClient := s.github.NewClientWithToken(token)
 
-	// Get the download URL for the repo
 	ref := req.Ref
 	if ref == "" {
-		ref = "main" // or "master" depending on the repo
+		ref = "main"
 	}
 
 	downloadURL, err := s.github.DownloadRepoArchive(r.Context(), ghClient, owner, repo, ref)
@@ -233,29 +274,24 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Download and extract the chart
 	chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL.String())
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// If a specific path is provided, use that
 	if req.Path != "" {
 		chartPath = filepath.Join(chartPath, req.Path)
 	}
 
-	// Analyze the chart
 	analysis, err := s.helmScanner.AnalyzeChart(chartPath)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Generate a result ID
 	resultID := uuid.New().String()
 
-	// Return the results
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"id":       resultID,
 		"results":  analysis,
@@ -268,7 +304,5 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetScanResults(w http.ResponseWriter, r *http.Request) {
-	// In a real implementation, you would fetch results from a database
-	// For now, we'll just return a not implemented response
 	http.Error(w, "Not implemented", http.StatusNotImplemented)
 }

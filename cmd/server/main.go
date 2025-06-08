@@ -3,11 +3,9 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
-
 	"github.com/joho/godotenv"
-	"github.com/AbdullahTarar/helm-guard-be/internal/config"
-	"helm-scanner/internal/server"
+	"helm-guard-be/internal/config"
+	"helm-guard-be/internal/server"
 )
 
 func main() {

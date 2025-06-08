@@ -1,1 +1,79 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Output of the go coverage tool
+*.cover
+*.prof
+
+# Dependency directories
+vendor/
+bin/
+pkg/
+
+# Go workspace file
+go.work
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment files
 .env
+.env.local
+.env*.local
+
+# Build output
+dist/
+build/
+
+# Debug files
+debug
+*.debug
+
+# Test output
+test-results/
+coverage.txt
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+*.bak
+*.tmp
+*.orig
+
+# Helm chart temp directories
+/tmp/
+helm-scanner/temp/
+
+# Configuration files with secrets
+config/secrets.yaml
+config/local.yaml
+
+# Certificate files
+*.pem
+*.key
+*.crt
+
+# Log files
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite

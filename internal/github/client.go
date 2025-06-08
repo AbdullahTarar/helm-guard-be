@@ -2,7 +2,6 @@ package github
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -40,11 +39,23 @@ func (c *Client) GetAuthURL(state string) string {
 }
 
 func (c *Client) ExchangeCode(ctx context.Context, code string) (*oauth2.Token, error) {
-	return c.config.Exchange(ctx, code)
+	// Inject a custom HTTP client that adds the required Accept header
+	client := &http.Client{
+		Transport: &acceptHeaderTransport{},
+	}
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, client)
+
+	token, err := c.config.Exchange(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("could not exchange code for token: %v", err)
+	}
+	return token, nil
 }
 
 func (c *Client) NewClientWithToken(token *oauth2.Token) *github.Client {
-	return c.client.WithAuthToken(token.AccessToken)
+	ts := oauth2.StaticTokenSource(token)
+	tc := oauth2.NewClient(context.Background(), ts)
+	return github.NewClient(tc)
 }
 
 func (c *Client) GetRepoContents(ctx context.Context, client *github.Client, owner, repo, path string) ([]*github.RepositoryContent, error) {
@@ -89,4 +100,23 @@ func (c *Client) HandleGitHubCallback(w http.ResponseWriter, r *http.Request) (s
 	}
 
 	return state, token, nil
+}
+
+func (c *Client) GetUserRepos(ctx context.Context, client *github.Client) ([]*github.Repository, error) {
+    // List all repositories for the authenticated user
+    repos, _, err := client.Repositories.List(ctx, "", &github.RepositoryListOptions{
+        Sort: "updated",
+        ListOptions: github.ListOptions{
+            PerPage: 100,
+        },
+    })
+    return repos, err
+}
+
+// acceptHeaderTransport ensures the GitHub token exchange response is JSON
+type acceptHeaderTransport struct{}
+
+func (t *acceptHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Accept", "application/json")
+	return http.DefaultTransport.RoundTrip(req)
 }

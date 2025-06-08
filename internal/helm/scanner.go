@@ -73,14 +73,14 @@ func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
 		return nil, errors.Wrap(err, "failed to render templates")
 	}
 
-	// Parse rendered resources
 	var resources []Resource
+	var vulnerabilities []Vulnerability
+
 	for path, content := range rendered {
 		if strings.TrimSpace(content) == "" {
 			continue
 		}
 
-		// Parse each document in the rendered file (might be multi-document YAML)
 		decoder := yaml.NewDecoder(strings.NewReader(content))
 		for {
 			var resource Resource
@@ -88,7 +88,6 @@ func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
 				if err == io.EOF {
 					break
 				}
-				// Skip documents that don't match our Resource structure
 				continue
 			}
 
@@ -96,64 +95,70 @@ func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
 				resources = append(resources, resource)
 			}
 		}
+
+		if strings.Contains(content, "password: ") {
+			vulnerabilities = append(vulnerabilities, Vulnerability{
+				Type:        "security",
+				RuleID:      "SEC002",
+				Severity:    "critical",
+				Description: "Hardcoded password detected",
+				Path:        path,
+			})
+		}
 	}
 
-	// Check for vulnerabilities
-	vulnerabilities := s.checkVulnerabilities(chart, resources)
+	vulnerabilities = append(vulnerabilities, s.checkResourceVulnerabilities(chart, resources)...)
 
 	return &ChartAnalysis{
-		Resources:    resources,
+		Resources:      resources,
 		Vulnerabilities: vulnerabilities,
-		Metadata:     chart.Metadata,
+		Metadata:       *chart.Metadata,
 	}, nil
 }
 
-func (s *Scanner) checkVulnerabilities(chart *chart.Chart, resources []Resource) []Vulnerability {
-	var vulnerabilities []Vulnerability
 
-	// Check chart metadata
-	if chart.Metadata.Deprecated {
-		vulnerabilities = append(vulnerabilities, Vulnerability{
-			Type:        "metadata",
-			RuleID:      "DEP001",
-			Severity:    "warning",
-			Description: "This chart is marked as deprecated",
-			Path:        "Chart.yaml",
-		})
-	}
+// Renamed to be more specific
+func (s *Scanner) checkResourceVulnerabilities(chart *chart.Chart, resources []Resource) []Vulnerability {
+    var vulnerabilities []Vulnerability
 
-	// Check for common security issues in resources
-	for _, resource := range resources {
-		// Example checks - expand with real security rules
-		if resource.Kind == "Pod" {
-			vulnerabilities = append(vulnerabilities, Vulnerability{
-				Type:        "security",
-				RuleID:      "SEC001",
-				Severity:    "high",
-				Description: "Direct Pod definitions are discouraged. Use Deployments or StatefulSets instead.",
-				Path:        resource.Kind + "/" + resource.Name,
-			})
-		}
+    // Check chart metadata
+    if chart.Metadata.Deprecated {
+        vulnerabilities = append(vulnerabilities, Vulnerability{
+            Type:        "metadata",
+            RuleID:      "DEP001",
+            Severity:    "warning",
+            Description: "This chart is marked as deprecated",
+            Path:        "Chart.yaml",
+        })
+    }
 
-		if resource.APIVersion == "extensions/v1beta1" || 
-		   resource.APIVersion == "apps/v1beta1" || 
-		   resource.APIVersion == "apps/v1beta2" {
-			vulnerabilities = append(vulnerabilities, Vulnerability{
-				Type:        "deprecation",
-				RuleID:      "DEP002",
-				Severity:    "medium",
-				Description: fmt.Sprintf("API version %s is deprecated", resource.APIVersion),
-				Path:        resource.Kind + "/" + resource.Name,
-			})
-		}
-	}
+    // Check resource-specific issues
+    for _, resource := range resources {
+        if resource.Kind == "Pod" {
+            vulnerabilities = append(vulnerabilities, Vulnerability{
+                Type:        "security",
+                RuleID:      "SEC001",
+                Severity:    "high",
+                Description: "Direct Pod definitions are discouraged",
+                Path:        resource.Kind + "/" + resource.Name,
+            })
+        }
 
-	// Check for insecure container configurations
-	// (This would be expanded with more detailed checks)
-	
-	return vulnerabilities
+        if resource.APIVersion == "extensions/v1beta1" || 
+           resource.APIVersion == "apps/v1beta1" || 
+           resource.APIVersion == "apps/v1beta2" {
+            vulnerabilities = append(vulnerabilities, Vulnerability{
+                Type:        "deprecation",
+                RuleID:      "DEP002",
+                Severity:    "medium",
+                Description: fmt.Sprintf("API version %s is deprecated", resource.APIVersion),
+                Path:        resource.Kind + "/" + resource.Name,
+            })
+        }
+    }
+    
+    return vulnerabilities
 }
-
 func (s *Scanner) DownloadAndExtractChart(ctx context.Context, downloadURL string) (string, error) {
 	// Create a temporary directory for this chart
 	chartDir, err := os.MkdirTemp(s.tempDir, "chart-")
