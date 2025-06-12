@@ -7,12 +7,13 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
-
+    "os"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"golang.org/x/oauth2"
-
+    "context"
+    "time"
 	"helm-guard-be/internal/config"
 	"helm-guard-be/internal/github"
 	"helm-guard-be/internal/helm"
@@ -237,70 +238,130 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
-	session, _ := s.store.Get(r, "helm-scanner-session")
-	token, ok := session.Values["github_token"].(*oauth2.Token)
-	if !ok {
-		http.Error(w, "Not authenticated with GitHub", http.StatusUnauthorized)
-		return
-	}
+    // Start with logging
+    log.Println("[DEBUG] Starting private repo scan handler")
+    startTime := time.Now()
+    
+    // 1. Session and token validation
+    session, err := s.store.Get(r, "helm-scanner-session")
+    if err != nil {
+        log.Printf("[ERROR] Session error: %v", err)
+        http.Error(w, "Session error", http.StatusInternalServerError)
+        return
+    }
 
-	var req struct {
-		RepoURL string `json:"repoUrl"`
-		Path    string `json:"path,omitempty"`
-		Ref     string `json:"ref,omitempty"`
-	}
+    token, ok := session.Values["github_token"].(*oauth2.Token)
+    if !ok || token == nil {
+        log.Println("[ERROR] Missing or invalid GitHub token in session")
+        http.Error(w, "Not authenticated with GitHub", http.StatusUnauthorized)
+        return
+    }
+    log.Println("[DEBUG] Valid GitHub token found")
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    // 2. Request body parsing
+    var req struct {
+        RepoURL string `json:"repoUrl"`
+        Path    string `json:"path,omitempty"`
+        Ref     string `json:"ref,omitempty"`
+    }
 
-	owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        log.Printf("[ERROR] Failed to decode request body: %v", err)
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+    log.Printf("[DEBUG] Processing repo: %s", req.RepoURL)
+
+    // 3. GitHub URL parsing
+    owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
+    if err != nil {
+        log.Printf("[ERROR] Failed to parse GitHub URL: %v", err)
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    log.Printf("[DEBUG] Extracted owner: %s, repo: %s", owner, repo)
+
+    // 4. GitHub client setup
+    ghClient := s.github.NewClientWithToken(token)
+    log.Println("[DEBUG] GitHub client created")
+
+    // 5. Set default ref if not provided
+    ref := req.Ref
+    if ref == "" {
+        ref = "main"
+    }
+    log.Printf("[DEBUG] Using ref: %s", ref)
+
+    // 6. Verify repository access first
+    ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+    defer cancel()
+
+	log.Println("[DEBUG] Checking repository access...")
+	repoInfo, _, err := ghClient.Repositories.Get(ctx, owner, repo)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		log.Printf("[ERROR] Failed to fetch repository info: %v", err)
+		http.Error(w, "Failed to access repository: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("[DEBUG] Repository verified. Default branch: %s", repoInfo.GetDefaultBranch())
 
-	ghClient := s.github.NewClientWithToken(token)
+    // 7. Get archive download URL
+    log.Println("[DEBUG] Getting archive download URL...")
+    downloadURL, err := s.github.DownloadRepoArchive(ctx, ghClient, owner, repo, ref)
+    if err != nil {
+        log.Printf("[ERROR] Failed to get download URL: %v", err)
+        http.Error(w, "Failed to get repository archive: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    log.Printf("[DEBUG] Download URL: %s", downloadURL.String())
 
-	ref := req.Ref
-	if ref == "" {
-		ref = "main"
-	}
+    // 8. Download and extract chart
+    log.Println("[DEBUG] Downloading and extracting chart...")
+    chartPath, err := s.helmScanner.DownloadAndExtractChart(ctx, downloadURL.String())
+    if err != nil {
+        log.Printf("[ERROR] Failed to download/extract chart: %v", err)
+        http.Error(w, "Failed to process repository: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    log.Printf("[DEBUG] Chart downloaded to: %s", chartPath)
 
-	downloadURL, err := s.github.DownloadRepoArchive(r.Context(), ghClient, owner, repo, ref)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to get download URL: %v", err), http.StatusInternalServerError)
-		return
-	}
+    // 9. Check for Chart.yaml
+    chartYamlPath := filepath.Join(chartPath, "Chart.yaml")
+    if _, err := os.Stat(chartYamlPath); os.IsNotExist(err) {
+        log.Printf("[ERROR] No Chart.yaml found in: %s", chartPath)
+        http.Error(w, "Repository does not contain a Helm chart", http.StatusBadRequest)
+        return
+    }
+    log.Println("[DEBUG] Chart.yaml found")
 
-	chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL.String())
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
-		return
-	}
+    // 10. Analyze chart
+    log.Println("[DEBUG] Analyzing chart...")
+    analysis, err := s.helmScanner.AnalyzeChart(chartPath)
+    if err != nil {
+        log.Printf("[ERROR] Failed to analyze chart: %v", err)
+        http.Error(w, "Failed to analyze chart: "+err.Error(), http.StatusInternalServerError)
+        return
+    }
+    log.Println("[DEBUG] Chart analysis completed")
 
-	if req.Path != "" {
-		chartPath = filepath.Join(chartPath, req.Path)
-	}
+    // 11. Prepare response
+    resultID := uuid.New().String()
+    response := map[string]interface{}{
+        "id":      resultID,
+        "results": analysis,
+        "metadata": map[string]string{
+            "repo": req.RepoURL,
+            "path": req.Path,
+            "ref":  ref,
+        },
+    }
 
-	analysis, err := s.helmScanner.AnalyzeChart(chartPath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	resultID := uuid.New().String()
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":       resultID,
-		"results":  analysis,
-		"metadata": map[string]string{
-			"repo": req.RepoURL,
-			"path": req.Path,
-			"ref":  ref,
-		},
-	})
+    log.Printf("[DEBUG] Scan completed in %v", time.Since(startTime))
+    w.Header().Set("Content-Type", "application/json")
+    if err := json.NewEncoder(w).Encode(response); err != nil {
+        log.Printf("[ERROR] Failed to encode response: %v", err)
+        http.Error(w, "Failed to generate response", http.StatusInternalServerError)
+    }
 }
 
 func (s *Server) handleGetScanResults(w http.ResponseWriter, r *http.Request) {
