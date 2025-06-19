@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
-
+	"archive/tar"
+	"compress/gzip"
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v3"
 	"helm.sh/helm/v3/pkg/chart"
@@ -49,35 +51,85 @@ type Vulnerability struct {
 	Path        string `json:"path"`
 }
 
+func findChartDir(baseDir string) (string, error) {
+	var chartDir string
+	log.Printf("Searching for Chart.yaml under %s", baseDir)
+	err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
+		log.Printf("Checking directory: %s", path)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(path, "Chart.yaml")); err == nil {
+			chartDir = path
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	if chartDir == "" {
+		return "", fmt.Errorf("no Chart.yaml found")
+	}
+	return chartDir, nil
+}
+
 func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
-	// Load the chart
-	chart, err := loader.Load(chartPath)
+	log.Printf("[DEBUG] Searching for Chart.yaml under %s", chartPath)
+
+	// Step 1: Locate Chart.yaml
+	actualChartPath, err := findChartDir(chartPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to locate Chart.yaml")
+	}
+
+	// Step 2: Load the chart
+	chart, err := loader.Load(actualChartPath)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to load chart")
 	}
 
-	// Create default values
-	values := chartutil.Values{}
-	for _, f := range chart.Raw {
-		if f.Name == "values.yaml" {
-			if err := yaml.Unmarshal(f.Data, &values); err != nil {
-				return nil, errors.Wrap(err, "failed to parse values.yaml")
-			}
-		}
+	// Step 3: Coalesce values (includes merging values.yaml and defaults)
+	vals, err := chartutil.CoalesceValues(chart, nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to coalesce chart values")
 	}
 
-	// Render the templates
+	// Step 4: Ensure required values to avoid nil pointer
+	if _, ok := vals["fullnameOverride"]; !ok {
+		vals["fullnameOverride"] = ""
+		log.Printf("[DEBUG] Injected missing 'fullnameOverride' = \"\"")
+	}
+	if _, ok := vals["nameOverride"]; !ok {
+		vals["nameOverride"] = ""
+		log.Printf("[DEBUG] Injected missing 'nameOverride' = \"\"")
+	}
+
+	// Debug: Print final values
+	if valuesYAML, err := yaml.Marshal(vals); err == nil {
+		log.Printf("[DEBUG] Final values:\n%s", string(valuesYAML))
+	}
+
+	// Step 5: Render templates using Helm engine
 	renderer := engine.Engine{}
-	rendered, err := renderer.Render(chart, values)
+	rendered, err := renderer.Render(chart, chartutil.Values(vals))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to render templates")
 	}
+	log.Printf("[DEBUG] Rendered %d files", len(rendered))
 
+	// Step 6: Analyze rendered resources
 	var resources []Resource
 	var vulnerabilities []Vulnerability
 
 	for path, content := range rendered {
+		log.Printf("[DEBUG] Processing rendered file: %s", path)
+
 		if strings.TrimSpace(content) == "" {
+			log.Printf("[DEBUG] Skipped empty content: %s", path)
 			continue
 		}
 
@@ -88,14 +140,17 @@ func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
 				if err == io.EOF {
 					break
 				}
+				log.Printf("[WARN] Failed to decode resource in %s: %v", path, err)
 				continue
 			}
 
 			if resource.APIVersion != "" && resource.Kind != "" {
 				resources = append(resources, resource)
+				log.Printf("[DEBUG] Found resource: Kind=%s, APIVersion=%s", resource.Kind, resource.APIVersion)
 			}
 		}
 
+		// Security check for hardcoded passwords
 		if strings.Contains(content, "password: ") {
 			vulnerabilities = append(vulnerabilities, Vulnerability{
 				Type:        "security",
@@ -104,16 +159,41 @@ func (s *Scanner) AnalyzeChart(chartPath string) (*ChartAnalysis, error) {
 				Description: "Hardcoded password detected",
 				Path:        path,
 			})
+			log.Printf("[VULN] Hardcoded password found in %s", path)
 		}
 	}
 
+	// Step 7: Run additional checks
+	log.Printf("[DEBUG] Running additional vulnerability checks...")
 	vulnerabilities = append(vulnerabilities, s.checkResourceVulnerabilities(chart, resources)...)
 
+	// Step 8: Final output
+	log.Printf("[DEBUG] Analysis complete — Resources: %d, Vulnerabilities: %d", len(resources), len(vulnerabilities))
+
 	return &ChartAnalysis{
-		Resources:      resources,
+		Resources:       resources,
 		Vulnerabilities: vulnerabilities,
-		Metadata:       *chart.Metadata,
+		Metadata:        *chart.Metadata,
 	}, nil
+}
+
+func mergeValues(dest, src map[string]interface{}) {
+    for k, v := range src {
+        if _, exists := dest[k]; !exists {
+            // Key doesn't exist in dest - simple copy
+            dest[k] = v
+        } else {
+            // Handle nested maps
+            if destMap, ok := dest[k].(map[string]interface{}); ok {
+                if srcMap, ok := v.(map[string]interface{}); ok {
+                    mergeValues(destMap, srcMap)
+                    continue
+                }
+            }
+            // Overwrite with source value
+            dest[k] = v
+        }
+    }
 }
 
 
@@ -160,13 +240,11 @@ func (s *Scanner) checkResourceVulnerabilities(chart *chart.Chart, resources []R
     return vulnerabilities
 }
 func (s *Scanner) DownloadAndExtractChart(ctx context.Context, downloadURL string) (string, error) {
-	// Create a temporary directory for this chart
 	chartDir, err := os.MkdirTemp(s.tempDir, "chart-")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create temp directory")
 	}
 
-	// Download the chart
 	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to download chart")
@@ -177,7 +255,6 @@ func (s *Scanner) DownloadAndExtractChart(ctx context.Context, downloadURL strin
 		return "", fmt.Errorf("failed to download chart: %s", resp.Status)
 	}
 
-	// Save the chart to a temporary file
 	tmpFile := filepath.Join(chartDir, "chart.tgz")
 	out, err := os.Create(tmpFile)
 	if err != nil {
@@ -189,29 +266,66 @@ func (s *Scanner) DownloadAndExtractChart(ctx context.Context, downloadURL strin
 		return "", errors.Wrap(err, "failed to save chart")
 	}
 
-	// Extract the chart
 	if err := extractTarGz(tmpFile, chartDir); err != nil {
 		return "", errors.Wrap(err, "failed to extract chart")
 	}
 
-	// Find the chart directory (GitHub archives have an extra top-level directory)
-	files, err := os.ReadDir(chartDir)
+	// 🔍 Recursively search entire extracted tree for Chart.yaml
+	actualChartDir, err := findChartDir(chartDir)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to read temp directory")
+		return "", errors.Wrap(err, "failed to locate Chart.yaml in extracted contents")
 	}
-
-	for _, file := range files {
-		if file.IsDir() && strings.HasPrefix(file.Name(), "chart") {
-			return filepath.Join(chartDir, file.Name()), nil
-		}
-	}
-
-	return "", fmt.Errorf("failed to find chart directory in archive")
+	return actualChartDir, nil
 }
 
+
+
+
 func extractTarGz(src, dst string) error {
-	// Implement tar.gz extraction here
-	// You can use archive/tar and compress/gzip packages
-	// This is a simplified placeholder
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+
+	tarReader := tar.NewReader(gzr)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break // end of archive
+		}
+		if err != nil {
+			return err
+		}
+
+		// Clean and prepare the file path
+		target := filepath.Join(dst, header.Name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, 0755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			outFile, err := os.Create(target)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
+				return err
+			}
+			outFile.Close()
+		}
+	}
 	return nil
 }
