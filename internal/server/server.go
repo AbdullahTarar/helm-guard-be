@@ -100,50 +100,43 @@ func (s *Server) routes() {
 }
 
 func (s *Server) handlePublicRepoScan(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		RepoURL string `json:"repoUrl"`
-		Path    string `json:"path,omitempty"`
-	}
+    var req struct {
+        RepoURL string `json:"repoUrl"`
+        Path    string `json:"path,omitempty"`
+    }
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
 
-	owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+    owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
 
-	downloadURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/main.tar.gz", owner, repo)
+    downloadURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/main.tar.gz", owner, repo)
 
-	chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
-		return
-	}
+    chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
+        return
+    }
 
-	if req.Path != "" {
-		chartPath = filepath.Join(chartPath, req.Path)
-	}
+    if req.Path != "" {
+        chartPath = filepath.Join(chartPath, req.Path)
+    }
 
-	analysis, err := s.helmScanner.AnalyzeChart(chartPath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
-		return
-	}
+    // Use the new comprehensive analysis method
+    results, err := s.helmScanner.AnalyzeChartComprehensive(chartPath, req.RepoURL)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
+        return
+    }
 
-	resultID := uuid.New().String()
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"id":       resultID,
-		"results":  analysis,
-		"metadata": map[string]string{
-			"repo": req.RepoURL,
-			"path": req.Path,
-		},
-	})
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(results)
 }
 
 func (s *Server) handleGetUserRepos(w http.ResponseWriter, r *http.Request) {
@@ -297,14 +290,14 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
     ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
     defer cancel()
 
-	log.Println("[DEBUG] Checking repository access...")
-	repoInfo, _, err := ghClient.Repositories.Get(ctx, owner, repo)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch repository info: %v", err)
-		http.Error(w, "Failed to access repository: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-	log.Printf("[DEBUG] Repository verified. Default branch: %s", repoInfo.GetDefaultBranch())
+    log.Println("[DEBUG] Checking repository access...")
+    repoInfo, _, err := ghClient.Repositories.Get(ctx, owner, repo)
+    if err != nil {
+        log.Printf("[ERROR] Failed to fetch repository info: %v", err)
+        http.Error(w, "Failed to access repository: "+err.Error(), http.StatusBadRequest)
+        return
+    }
+    log.Printf("[DEBUG] Repository verified. Default branch: %s", repoInfo.GetDefaultBranch())
 
     // 7. Get archive download URL
     log.Println("[DEBUG] Getting archive download URL...")
@@ -337,10 +330,10 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
 
     // 10. Analyze chart
     log.Println("[DEBUG] Analyzing chart...")
-    analysis, err := s.helmScanner.AnalyzeChart(chartPath)
+    results, err := s.helmScanner.AnalyzeChartComprehensive(chartPath, req.RepoURL)
     if err != nil {
         log.Printf("[ERROR] Failed to analyze chart: %v", err)
-        http.Error(w, "Failed to analyze chart: "+err.Error(), http.StatusInternalServerError)
+        http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
         return
     }
     log.Println("[DEBUG] Chart analysis completed")
@@ -348,8 +341,8 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
     // 11. Prepare response
     resultID := uuid.New().String()
     response := map[string]interface{}{
-        "id":      resultID,
-        "results": analysis,
+        "id":       resultID,
+        "results":  results, // Changed from 'analysis' to 'results'
         "metadata": map[string]string{
             "repo": req.RepoURL,
             "path": req.Path,
@@ -364,7 +357,6 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
         http.Error(w, "Failed to generate response", http.StatusInternalServerError)
     }
 }
-
 func (s *Server) handleGetScanResults(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "Not implemented", http.StatusNotImplemented)
 }
