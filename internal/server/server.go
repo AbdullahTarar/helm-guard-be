@@ -50,7 +50,7 @@ func New(cfg *config.Config) (*Server, error) {
 		HttpOnly: true,
 		Secure:   false, // Set to true in production
 		SameSite: http.SameSiteLaxMode,
-		Domain:   "equationsquare.com",
+		Domain:   ".equationsquare.com",
 	}
 
 	// Initialize Helm scanner
