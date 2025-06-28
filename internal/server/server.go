@@ -87,7 +87,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	s.router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+			w.Header().Set("Access-Control-Allow-Origin", s.config.Server.FrontendURL)
 			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -107,46 +107,241 @@ func (s *Server) routes() {
 	s.router.HandleFunc("/api/scan/private", s.handlePrivateRepoScan).Methods("POST", "OPTIONS")
 	s.router.HandleFunc("/api/scan/results/{id}", s.handleGetScanResults).Methods("GET")
 	s.router.HandleFunc("/api/github/repos", s.handleGetUserRepos).Methods("GET", "OPTIONS")
+	s.router.HandleFunc("/api/auth/status", s.handleAuthStatus).Methods("GET")
 }
 
 func (s *Server) handlePublicRepoScan(w http.ResponseWriter, r *http.Request) {
+	// Start with logging
+	log.Println("[DEBUG] Starting public repo scan handler")
+	startTime := time.Now()
+
+	// 1. Request body parsing
 	var req struct {
 		RepoURL string `json:"repoUrl"`
 		Path    string `json:"path,omitempty"`
+		Ref     string `json:"ref,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[ERROR] Failed to decode request body: %v", err)
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+	log.Printf("[DEBUG] Processing repo: %s", req.RepoURL)
 
+	// 2. GitHub URL parsing
 	owner, repo, err := s.github.ParseGitHubURL(req.RepoURL)
 	if err != nil {
+		log.Printf("[ERROR] Failed to parse GitHub URL: %v", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("[DEBUG] Extracted owner: %s, repo: %s", owner, repo)
 
-	downloadURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/main.tar.gz", owner, repo)
+	// 3. Set default ref if not provided
+	ref := req.Ref
+	if ref == "" {
+		ref = "main"
+	}
+	log.Printf("[DEBUG] Using ref: %s", ref)
 
-	chartPath, err := s.helmScanner.DownloadAndExtractChart(r.Context(), downloadURL)
+	// 4. Try multiple branch names (main, master, default)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	var downloadURL string
+	branchesToTry := []string{ref}
+
+	// If ref is "main", also try "master" as fallback
+	if ref == "main" {
+		branchesToTry = append(branchesToTry, "master")
+	}
+
+	// 5. Verify repository exists and get default branch
+	log.Println("[DEBUG] Checking repository access...")
+
+	// Create a simple HTTP client to check repo existence
+	checkURL := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+	resp, err := http.Get(checkURL)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to download chart: %v", err), http.StatusInternalServerError)
+		log.Printf("[ERROR] Failed to check repository: %v", err)
+		http.Error(w, "Failed to access repository", http.StatusBadRequest)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		log.Printf("[ERROR] Repository not found: %s/%s", owner, repo)
+		http.Error(w, "Repository not found or is private", http.StatusNotFound)
+		return
+	} else if resp.StatusCode != 200 {
+		log.Printf("[ERROR] GitHub API returned status %d", resp.StatusCode)
+		http.Error(w, "Failed to verify repository", http.StatusBadRequest)
 		return
 	}
 
-	if req.Path != "" {
-		chartPath = filepath.Join(chartPath, req.Path)
+	// Parse the response to get default branch
+	var repoInfo struct {
+		DefaultBranch string `json:"default_branch"`
+		Private       bool   `json:"private"`
 	}
 
-	// Use the new comprehensive analysis method
-	results, err := s.helmScanner.AnalyzeChartComprehensive(chartPath, req.RepoURL)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to analyze chart: %v", err), http.StatusInternalServerError)
+	if err := json.NewDecoder(resp.Body).Decode(&repoInfo); err != nil {
+		log.Printf("[WARNING] Failed to parse repo info, continuing with default branch: %v", err)
+	} else {
+		log.Printf("[DEBUG] Repository default branch: %s, private: %v", repoInfo.DefaultBranch, repoInfo.Private)
+
+		if repoInfo.Private {
+			log.Printf("[ERROR] Repository is private: %s/%s", owner, repo)
+			http.Error(w, "Repository is private. Please use the private repository option.", http.StatusForbidden)
+			return
+		}
+
+		// Use the actual default branch if ref was "main"
+		if ref == "main" && repoInfo.DefaultBranch != "" {
+			branchesToTry = []string{repoInfo.DefaultBranch, "main", "master"}
+		}
+	}
+
+	// 6. Try to find a working branch
+	for _, branch := range branchesToTry {
+		testURL := fmt.Sprintf("https://github.com/%s/%s/archive/refs/heads/%s.tar.gz", owner, repo, branch)
+		log.Printf("[DEBUG] Trying branch: %s", branch)
+
+		// Test if the branch exists by making a HEAD request
+		headReq, err := http.NewRequestWithContext(ctx, "HEAD", testURL, nil)
+		if err != nil {
+			continue
+		}
+
+		headResp, err := http.DefaultClient.Do(headReq)
+		if err != nil {
+			log.Printf("[DEBUG] Branch %s not accessible: %v", branch, err)
+			continue
+		}
+		headResp.Body.Close()
+
+		if headResp.StatusCode == 200 {
+			downloadURL = testURL
+			ref = branch
+			log.Printf("[DEBUG] Using branch: %s", branch)
+			break
+		}
+		log.Printf("[DEBUG] Branch %s returned status %d", branch, headResp.StatusCode)
+	}
+
+	if downloadURL == "" {
+		log.Printf("[ERROR] No accessible branch found for %s/%s", owner, repo)
+		http.Error(w, "No accessible branch found (tried: main, master)", http.StatusNotFound)
 		return
+	}
+
+	log.Printf("[DEBUG] Download URL: %s", downloadURL)
+
+	// 7. Create scan ID and initialize scan record
+	scanID := uuid.New().String()
+	now := time.Now()
+
+	// Initialize with status fields
+	s.scanStorage.mu.Lock()
+	s.scanStorage.scans[scanID] = &helm.ScanResults{
+		Repository: helm.Repository{
+			Name:     repo,
+			URL:      req.RepoURL,
+			Branch:   ref,
+			ScanDate: now,
+		},
+		Status:    "processing",
+		StartedAt: now,
+	}
+	s.scanStorage.mu.Unlock()
+
+	log.Printf("[DEBUG] Scan %s initialized", scanID)
+
+	// 8. Start async processing
+	go func() {
+		log.Printf("[DEBUG] Starting async processing for scan %s", scanID)
+
+		// Download and extract chart
+		chartPath, err := s.helmScanner.DownloadAndExtractChart(context.Background(), downloadURL)
+		if err != nil {
+			log.Printf("[ERROR] Failed to download/extract chart for scan %s: %v", scanID, err)
+			s.updateScanStatus(scanID, "failed", fmt.Sprintf("Failed to download chart: %v", err))
+			return
+		}
+		log.Printf("[DEBUG] Chart downloaded to: %s", chartPath)
+
+		// Adjust path if specified
+		if req.Path != "" {
+			chartPath = filepath.Join(chartPath, req.Path)
+			log.Printf("[DEBUG] Using custom path: %s", chartPath)
+		}
+
+		// Check for Chart.yaml
+		chartYamlPath := filepath.Join(chartPath, "Chart.yaml")
+		if _, err := os.Stat(chartYamlPath); os.IsNotExist(err) {
+			log.Printf("[ERROR] No Chart.yaml found in: %s", chartPath)
+			s.updateScanStatus(scanID, "failed", "Repository does not contain a Helm chart")
+			return
+		}
+		log.Println("[DEBUG] Chart.yaml found")
+
+		// Analyze chart
+		results, err := s.helmScanner.AnalyzeChartComprehensive(chartPath, req.RepoURL)
+
+		s.scanStorage.mu.Lock()
+		defer s.scanStorage.mu.Unlock()
+
+		if scan, exists := s.scanStorage.scans[scanID]; exists {
+			if err != nil {
+				log.Printf("[ERROR] Failed to analyze chart for scan %s: %v", scanID, err)
+				scan.Status = "failed"
+				scan.ErrorMessage = err.Error()
+				scan.CompletedAt = time.Now()
+			} else {
+				log.Printf("[DEBUG] Chart analysis completed for scan %s", scanID)
+				// Update the existing scan object instead of replacing it
+				scan.Repository = results.Repository
+				scan.Summary = results.Summary
+				scan.Charts = results.Charts
+				scan.SecurityFindings = results.SecurityFindings
+				scan.Resources = results.Resources
+				scan.BestPractices = results.BestPractices
+				scan.Status = "completed"
+				scan.CompletedAt = time.Now()
+			}
+		}
+
+		log.Printf("[DEBUG] Scan %s completed in %v", scanID, time.Since(startTime))
+	}()
+
+	// 9. Return immediate response
+	response := map[string]interface{}{
+		"id":       scanID,
+		"status":   "processing",
+		"message":  "Scan started successfully",
+		"scanDate": now.Format(time.RFC3339),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("[ERROR] Failed to encode response: %v", err)
+		http.Error(w, "Failed to generate response", http.StatusInternalServerError)
+	}
+}
+
+// Helper function to update scan status
+func (s *Server) updateScanStatus(scanID, status, errorMessage string) {
+	s.scanStorage.mu.Lock()
+	defer s.scanStorage.mu.Unlock()
+
+	if scan, exists := s.scanStorage.scans[scanID]; exists {
+		scan.Status = status
+		if errorMessage != "" {
+			scan.ErrorMessage = errorMessage
+		}
+		scan.CompletedAt = time.Now()
+	}
 }
 
 func (s *Server) handleGetUserRepos(w http.ResponseWriter, r *http.Request) {
@@ -237,7 +432,22 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, "http://localhost:3000/?auth=success", http.StatusFound)
+	http.Redirect(w, r, s.config.Server.FrontendURL+"/repositories", http.StatusFound)
+}
+
+func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+	session, err := s.store.Get(r, "helm-scanner-session")
+	if err != nil {
+		log.Printf("Error getting session: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	authenticated, _ := session.Values["authenticated"].(bool)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{
+		"authenticated": authenticated,
+	})
 }
 
 func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
@@ -353,15 +563,6 @@ func (s *Server) handlePrivateRepoScan(w http.ResponseWriter, r *http.Request) {
 	s.scanStorage.scans[resultID] = results
 	s.scanStorage.mu.Unlock()
 
-	// response := map[string]interface{}{
-	//     "id":       resultID,
-	//     "results":  results, // Changed from 'analysis' to 'results'
-	//     "metadata": map[string]string{
-	//         "repo": req.RepoURL,
-	//         "path": req.Path,
-	//         "ref":  ref,
-	//     },
-	// }
 	response := map[string]interface{}{
 		"id":      resultID,
 		"status":  "completed",

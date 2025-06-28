@@ -24,7 +24,8 @@ import (
 )
 
 type Scanner struct {
-	tempDir string
+	tempDir   string
+	chartPath string
 }
 
 func NewScanner(tempDir string) (*Scanner, error) {
@@ -42,6 +43,10 @@ type ScanResults struct {
 	SecurityFindings []SecurityFinding `json:"securityFindings"`
 	Resources        []Resource        `json:"resources"`
 	BestPractices    []BestPractice    `json:"bestPractices"`
+	Status           string            `json:"status"` // "processing", "completed", "failed"
+	ErrorMessage     string            `json:"errorMessage,omitempty"`
+	StartedAt        time.Time         `json:"startedAt"`
+	CompletedAt      time.Time         `json:"completedAt,omitempty"`
 }
 
 type Repository struct {
@@ -71,14 +76,14 @@ type ChartInfo struct {
 }
 
 type SecurityFinding struct {
-	ID             string  `json:"id"`
-	Severity       string  `json:"severity"`
-	Title          string  `json:"title"`
-	Description    string  `json:"description"`
-	File           string  `json:"file"`
-	Line           *int    `json:"line,omitempty"`
-	Recommendation string  `json:"recommendation"`
-	Category       string  `json:"category"`
+	ID             string `json:"id"`
+	Severity       string `json:"severity"`
+	Title          string `json:"title"`
+	Description    string `json:"description"`
+	File           string `json:"file"`
+	Line           *int   `json:"line,omitempty"`
+	Recommendation string `json:"recommendation"`
+	Category       string `json:"category"`
 }
 
 type Resource struct {
@@ -94,10 +99,10 @@ type Resource struct {
 }
 
 type BestPractice struct {
-	Category string              `json:"category"`
-	Passed   int                 `json:"passed"`
-	Total    int                 `json:"total"`
-	Items    []BestPracticeItem  `json:"items"`
+	Category string             `json:"category"`
+	Passed   int                `json:"passed"`
+	Total    int                `json:"total"`
+	Items    []BestPracticeItem `json:"items"`
 }
 
 type BestPracticeItem struct {
@@ -142,9 +147,9 @@ func (s *Scanner) getSecurityRules() []SecurityRule {
 			Severity:       "critical",
 			Recommendation: "Set securityContext.runAsNonRoot: true and securityContext.runAsUser to a non-root UID",
 			CheckFunc: func(resource *Resource, content string) bool {
-				return resource.Type == "Deployment" && 
-					   (strings.Contains(content, "runAsUser: 0") || 
-					    !strings.Contains(content, "runAsNonRoot: true"))
+				return resource.Type == "Deployment" &&
+					(strings.Contains(content, "runAsUser: 0") ||
+						!strings.Contains(content, "runAsNonRoot: true"))
 			},
 		},
 		{
@@ -166,10 +171,10 @@ func (s *Scanner) getSecurityRules() []SecurityRule {
 			Severity:       "high",
 			Recommendation: "Add resources.limits.cpu and resources.limits.memory",
 			CheckFunc: func(resource *Resource, content string) bool {
-				return resource.Type == "Deployment" && 
-					   (!strings.Contains(content, "limits:") || 
-					    !strings.Contains(content, "cpu:") || 
-					    !strings.Contains(content, "memory:"))
+				return resource.Type == "Deployment" &&
+					(!strings.Contains(content, "limits:") ||
+						!strings.Contains(content, "cpu:") ||
+						!strings.Contains(content, "memory:"))
 			},
 		},
 		{
@@ -180,8 +185,8 @@ func (s *Scanner) getSecurityRules() []SecurityRule {
 			Severity:       "high",
 			Recommendation: "Use specific image tags instead of 'latest'",
 			CheckFunc: func(resource *Resource, content string) bool {
-				return strings.Contains(content, ":latest") || 
-					   regexp.MustCompile(`image:\s*[\w\-\.]+/[\w\-\.]+$`).MatchString(content)
+				return strings.Contains(content, ":latest") ||
+					regexp.MustCompile(`image:\s*[\w\-\.]+/[\w\-\.]+$`).MatchString(content)
 			},
 		},
 		{
@@ -203,8 +208,8 @@ func (s *Scanner) getSecurityRules() []SecurityRule {
 			Severity:       "medium",
 			Recommendation: "Set securityContext.readOnlyRootFilesystem: true",
 			CheckFunc: func(resource *Resource, content string) bool {
-				return resource.Type == "Deployment" && 
-					   !strings.Contains(content, "readOnlyRootFilesystem: true")
+				return resource.Type == "Deployment" &&
+					!strings.Contains(content, "readOnlyRootFilesystem: true")
 			},
 		},
 		{
@@ -215,8 +220,20 @@ func (s *Scanner) getSecurityRules() []SecurityRule {
 			Severity:       "medium",
 			Recommendation: "Add securityContext.capabilities.drop: [\"ALL\"]",
 			CheckFunc: func(resource *Resource, content string) bool {
-				return resource.Type == "Deployment" && 
-					   !strings.Contains(content, "drop:")
+				return resource.Type == "Deployment" &&
+					!strings.Contains(content, "drop:")
+			},
+		},
+		{
+			ID:             "SEC-008",
+			Category:       "Security Context",
+			Title:          "Hardcoded credentials detected",
+			Description:    "Hardcoded credentials found in template",
+			Severity:       "critical",
+			Recommendation: "Use Kubernetes Secrets to store credentials",
+			CheckFunc: func(resource *Resource, content string) bool {
+				return strings.Contains(content, "password:") ||
+					strings.Contains(content, "PASSWORD:")
 			},
 		},
 	}
@@ -332,9 +349,14 @@ func (s *Scanner) AnalyzeChartComprehensive(chartPath, repositoryURL string) (*S
 	if err != nil {
 		return nil, err
 	}
+	valuesFile := filepath.Join(chartPath, "values.yaml")
+	valuesContent, err := os.ReadFile(valuesFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read values.yaml")
+	}
 
 	// Step 4: Perform security analysis
-	securityFindings := s.performSecurityAnalysis(resources, rendered)
+	securityFindings := s.performSecurityAnalysis(resources, rendered, string(valuesContent))
 
 	// Step 5: Perform best practices analysis
 	bestPractices := s.performBestPracticesAnalysis(resources, rendered)
@@ -436,30 +458,30 @@ func (s *Scanner) renderChart(chart *chart.Chart) (map[string]string, []Resource
 	}
 
 	// Render templates
-    renderer := engine.Engine{}
-    rendered, err := renderer.Render(chart, vals)
-    if err != nil {
-        return nil, nil, errors.Wrap(err, "failed to render templates")
-    }
+	renderer := engine.Engine{}
+	rendered, err := renderer.Render(chart, vals)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to render templates")
+	}
 
-    // Parse resources
-    var resources []Resource
-    for path, content := range rendered {
-        if strings.TrimSpace(content) == "" || 
-           strings.Contains(path, "/tests/") || 
-           strings.HasSuffix(path, "NOTES.txt") {
-            continue
-        }
+	// Parse resources
+	var resources []Resource
+	for path, content := range rendered {
+		if strings.TrimSpace(content) == "" ||
+			strings.Contains(path, "/tests/") ||
+			strings.HasSuffix(path, "NOTES.txt") {
+			continue
+		}
 
-        decoder := yaml.NewDecoder(strings.NewReader(content))
-        for {
-            var resourceMap map[string]interface{}
-            if err := decoder.Decode(&resourceMap); err != nil {
-                if err == io.EOF {
-                    break
-                }
-                continue
-            }
+		decoder := yaml.NewDecoder(strings.NewReader(content))
+		for {
+			var resourceMap map[string]interface{}
+			if err := decoder.Decode(&resourceMap); err != nil {
+				if err == io.EOF {
+					break
+				}
+				continue
+			}
 
 			if _, ok := resourceMap["apiVersion"].(string); ok {
 				if kind, ok := resourceMap["kind"].(string); ok {
@@ -469,24 +491,24 @@ func (s *Scanner) renderChart(chart *chart.Chart) (map[string]string, []Resource
 						Namespace: s.extractNamespace(resourceMap),
 					}
 
-                    // Extract additional details based on resource type
-                    s.extractResourceDetails(&resource, resourceMap, content)
-                    resources = append(resources, resource)
-                }
-            }
-        }
-    }
+					// Extract additional details based on resource type
+					s.extractResourceDetails(&resource, resourceMap, content)
+					resources = append(resources, resource)
+				}
+			}
+		}
+	}
 
-    return rendered, resources, nil
+	return rendered, resources, nil
 }
 
 func (s *Scanner) extractName(resourceMap map[string]interface{}) string {
-    if metadata, ok := resourceMap["metadata"].(map[string]interface{}); ok {
-        if name, ok := metadata["name"].(string); ok {
-            return name
-        }
-    }
-    return "unknown"
+	if metadata, ok := resourceMap["metadata"].(map[string]interface{}); ok {
+		if name, ok := metadata["name"].(string); ok {
+			return name
+		}
+	}
+	return "unknown"
 }
 
 func (s *Scanner) extractNamespace(resourceMap map[string]interface{}) string {
@@ -573,59 +595,138 @@ func (s *Scanner) extractIngressHosts(resourceMap map[string]interface{}) []stri
 	return hosts
 }
 
-func (s *Scanner) performSecurityAnalysis(resources []Resource, rendered map[string]string) []SecurityFinding {
-    var findings []SecurityFinding
-    rules := s.getSecurityRules()
-    
-    findingID := 1
-    for _, rule := range rules {
-        for _, resource := range resources {
-            // Find the rendered content for this resource
-            var content string
-            var filePath string // Track the path where the resource was found
-            
-            for path, renderedContent := range rendered {
-                if strings.Contains(renderedContent, resource.Name) {
-                    content = renderedContent
-                    filePath = path
-                    break
-                }
-            }
+func (s *Scanner) performSecurityAnalysis(resources []Resource, rendered map[string]string, valuesContent string) []SecurityFinding {
+	var findings []SecurityFinding
+	rules := s.getSecurityRules()
 
-            if rule.CheckFunc(&resource, content) {
-                findings = append(findings, SecurityFinding{
-                    ID:             fmt.Sprintf("SEC-%03d", findingID),
-                    Severity:       rule.Severity,
-                    Title:          rule.Title,
-                    Description:    rule.Description,
-                    File:           filePath, // Use the actual path where found
-                    Line:           nil,      // Could be enhanced to find actual line numbers
-                    Recommendation: rule.Recommendation,
-                    Category:       rule.Category,
-                })
-                findingID++
-            }
-        }
-    }
+	findingID := 1
 
-    // Additional hardcoded checks
-    for path, content := range rendered {
-        if strings.Contains(content, "password:") || strings.Contains(content, "PASSWORD:") {
-            findings = append(findings, SecurityFinding{
-                ID:             fmt.Sprintf("SEC-%03d", findingID),
-                Severity:       "critical",
-                Title:          "Hardcoded credentials detected",
-                Description:    "Hardcoded password or credential found in template",
-                File:           path,
-                Line:           nil,
-                Recommendation: "Use Kubernetes Secrets to store credentials",
-                Category:       "Secret Management",
-            })
-            findingID++
-        }
-    }
+	// 1. Check security rules against rendered templates
+	for _, rule := range rules {
+		for _, resource := range resources {
+			// Find the rendered content for this resource
+			var content string
+			var filePath string
 
-    return findings
+			for path, renderedContent := range rendered {
+				if strings.Contains(renderedContent, resource.Name) {
+					content = renderedContent
+					filePath = path
+					break
+				}
+			}
+
+			if rule.CheckFunc(&resource, content) {
+				findings = append(findings, SecurityFinding{
+					ID:             fmt.Sprintf("SEC-%03d", findingID),
+					Severity:       rule.Severity,
+					Title:          rule.Title,
+					Description:    rule.Description,
+					File:           filePath,
+					Line:           nil,
+					Recommendation: rule.Recommendation,
+					Category:       rule.Category,
+				})
+				findingID++
+			}
+		}
+	}
+
+	// 2. Check values.yaml for hardcoded credentials if content is provided
+	if valuesContent != "" {
+		if strings.Contains(valuesContent, "password:") || strings.Contains(valuesContent, "PASSWORD:") {
+			findings = append(findings, SecurityFinding{
+				ID:             fmt.Sprintf("SEC-%03d", findingID),
+				Severity:       "critical",
+				Title:          "Hardcoded credentials in values.yaml",
+				Description:    "Sensitive values should not be hardcoded in values.yaml",
+				File:           "values.yaml",
+				Recommendation: "Use Helm secrets management or --set for sensitive values",
+				Category:       "Secret Management",
+			})
+			findingID++
+		}
+	}
+
+	// 3. Check rendered templates for hardcoded credentials
+	for path, content := range rendered {
+		if strings.Contains(content, "password:") || strings.Contains(content, "PASSWORD:") {
+			findings = append(findings, SecurityFinding{
+				ID:             fmt.Sprintf("SEC-%03d", findingID),
+				Severity:       "critical",
+				Title:          "Hardcoded credentials detected",
+				Description:    "Hardcoded password or credential found in template",
+				File:           path,
+				Recommendation: "Use Kubernetes Secrets to store credentials",
+				Category:       "Secret Management",
+			})
+			findingID++
+		}
+	}
+
+	return findings
+}
+
+// Helper function to detect false positives
+func isLikelyFalsePositive(content, pattern string) bool {
+	// Skip commented lines
+	if strings.HasPrefix(strings.TrimSpace(content), "#") ||
+		strings.HasPrefix(strings.TrimSpace(content), "//") {
+		return true
+	}
+
+	// Skip example values
+	if strings.Contains(content, "example") ||
+		strings.Contains(content, "changeme") ||
+		strings.Contains(content, "TODO") {
+		return true
+	}
+
+	return false
+}
+
+// Check for hardcoded credentials in values.yaml
+func hasHardcodedCredentials(content string) bool {
+	patterns := []string{
+		`password:\s*["']?[^\s"']+["']?`,
+		`PASSWORD:\s*["']?[^\s"']+["']?`,
+		`secret:\s*["']?[^\s"']+["']?`,
+		`credentials:\s*["']?[^\s"']+["']?`,
+	}
+
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		if re.MatchString(content) {
+			// Additional validation to exclude comments
+			lines := strings.Split(content, "\n")
+			for _, line := range lines {
+				if re.MatchString(line) && !strings.HasPrefix(strings.TrimSpace(line), "#") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// Check for empty/default passwords
+func hasEmptyPasswords(content string) bool {
+	emptyPatterns := []string{
+		`password:\s*["']?["']?`,
+		`password:\s*""`,
+		`password:\s*''`,
+		`password:\s*null`,
+		`password:\s*changeme`,
+		`password:\s*password`,
+	}
+
+	for _, pattern := range emptyPatterns {
+		re := regexp.MustCompile(pattern)
+		if re.MatchString(content) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) performBestPracticesAnalysis(resources []Resource, rendered map[string]string) []BestPractice {
@@ -690,7 +791,7 @@ func (s *Scanner) calculateSummary(findings []SecurityFinding, practices []BestP
 		// Weight different severities
 		weightedFailures := summary.Critical*10 + summary.High*5 + summary.Medium*2 + summary.Low*1
 		maxPossibleScore := totalChecks * 10 // Assuming all could be critical
-		
+
 		summary.Score = 100 - (weightedFailures*100)/maxPossibleScore
 		if summary.Score < 0 {
 			summary.Score = 0
@@ -708,8 +809,8 @@ func (s *Scanner) checkNonRootUser(resources []Resource, rendered map[string]str
 		if resource.Type == "Deployment" {
 			for _, content := range rendered {
 				if strings.Contains(content, resource.Name) {
-					return strings.Contains(content, "runAsNonRoot: true") && 
-						   !strings.Contains(content, "runAsUser: 0")
+					return strings.Contains(content, "runAsNonRoot: true") &&
+						!strings.Contains(content, "runAsUser: 0")
 				}
 			}
 		}
@@ -744,9 +845,9 @@ func (s *Scanner) checkResourceLimits(resources []Resource, rendered map[string]
 		if resource.Type == "Deployment" {
 			for _, content := range rendered {
 				if strings.Contains(content, resource.Name) {
-					return strings.Contains(content, "limits:") && 
-						   strings.Contains(content, "cpu:") && 
-						   strings.Contains(content, "memory:")
+					return strings.Contains(content, "limits:") &&
+						strings.Contains(content, "cpu:") &&
+						strings.Contains(content, "memory:")
 				}
 			}
 		}
@@ -755,14 +856,43 @@ func (s *Scanner) checkResourceLimits(resources []Resource, rendered map[string]
 }
 
 func (s *Scanner) checkImageScan(resources []Resource, rendered map[string]string) bool {
-	// This would typically integrate with image scanning tools
-	// For now, we'll check if specific image tags are used (not latest)
+	// Patterns to detect problematic image tags
+	badPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`image:\s*[\w\-\.]+\/[\w\-\.]+$`), // No tag specified
+		regexp.MustCompile(`image:\s*.+:latest`),             // Latest tag
+		regexp.MustCompile(`image:\s*.+:(dev|test|stage)`),   // Environment tags
+	}
+
+	// Patterns for good versioning
+	goodPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`image:\s*.+:\d+\.\d+\.\d+`),       // Semantic versioning
+		regexp.MustCompile(`image:\s*.+@sha256:[a-f0-9]{64}`), // Digest reference
+	}
+
+	badCount := 0
+	goodCount := 0
+
 	for _, content := range rendered {
-		if strings.Contains(content, ":latest") {
-			return false
+		// Skip empty or test files
+		if strings.TrimSpace(content) == "" || strings.Contains(content, "test") {
+			continue
+		}
+
+		for _, pattern := range badPatterns {
+			if pattern.MatchString(content) {
+				badCount++
+			}
+		}
+
+		for _, pattern := range goodPatterns {
+			if pattern.MatchString(content) {
+				goodCount++
+			}
 		}
 	}
-	return true
+
+	// Pass if we have more good patterns than bad ones
+	return goodCount > badCount
 }
 
 func (s *Scanner) checkSecretsNotInEnv(resources []Resource, rendered map[string]string) bool {
@@ -820,8 +950,8 @@ func (s *Scanner) checkHealthChecks(resources []Resource, rendered map[string]st
 		if resource.Type == "Deployment" {
 			for _, content := range rendered {
 				if strings.Contains(content, resource.Name) {
-					return strings.Contains(content, "livenessProbe:") || 
-						   strings.Contains(content, "readinessProbe:")
+					return strings.Contains(content, "livenessProbe:") ||
+						strings.Contains(content, "readinessProbe:")
 				}
 			}
 		}
@@ -852,182 +982,282 @@ func (s *Scanner) checkMultipleReplicas(resources []Resource, rendered map[strin
 }
 
 func (s *Scanner) checkPodDisruptionBudget(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "PodDisruptionBudget" {
-            return true
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "PodDisruptionBudget" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkGracefulShutdown(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "Deployment" {
-            for _, content := range rendered {
-                if strings.Contains(content, resource.Name) {
-                    return strings.Contains(content, "terminationGracePeriodSeconds:") &&
-                           strings.Contains(content, "preStop:")
-                }
-            }
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "Deployment" {
+			for _, content := range rendered {
+				if strings.Contains(content, resource.Name) {
+					return strings.Contains(content, "terminationGracePeriodSeconds:") &&
+						strings.Contains(content, "preStop:")
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkRollingUpdate(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "Deployment" {
-            for _, content := range rendered {
-                if strings.Contains(content, resource.Name) {
-                    return strings.Contains(content, "rollingUpdate:") &&
-                           strings.Contains(content, "maxUnavailable:") &&
-                           strings.Contains(content, "maxSurge:")
-                }
-            }
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "Deployment" {
+			for _, content := range rendered {
+				if strings.Contains(content, resource.Name) {
+					return strings.Contains(content, "rollingUpdate:") &&
+						strings.Contains(content, "maxUnavailable:") &&
+						strings.Contains(content, "maxSurge:")
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkPersistentVolumes(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "PersistentVolumeClaim" {
-            return true
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "PersistentVolumeClaim" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkExternalizedConfig(resources []Resource, rendered map[string]string) bool {
-    hasConfigMap := false
-    hasSecret := false
-    
-    for _, resource := range resources {
-        if resource.Type == "ConfigMap" {
-            hasConfigMap = true
-        }
-        if resource.Type == "Secret" {
-            hasSecret = true
-        }
-    }
-    
-    return hasConfigMap || hasSecret
+	hasConfigMap := false
+	hasSecret := false
+
+	for _, resource := range resources {
+		if resource.Type == "ConfigMap" {
+			hasConfigMap = true
+		}
+		if resource.Type == "Secret" {
+			hasSecret = true
+		}
+	}
+
+	return hasConfigMap || hasSecret
 }
 
 func (s *Scanner) checkLabelsAnnotations(resources []Resource, rendered map[string]string) bool {
-    for _, content := range rendered {
-        if strings.Contains(content, "metadata:") {
-            return strings.Contains(content, "labels:") &&
-                   strings.Contains(content, "annotations:")
-        }
-    }
-    return false
+	for _, content := range rendered {
+		if strings.Contains(content, "metadata:") {
+			return strings.Contains(content, "labels:") &&
+				strings.Contains(content, "annotations:")
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkAntiAffinity(resources []Resource, rendered map[string]string) bool {
-    for _, content := range rendered {
-        if strings.Contains(content, "affinity:") &&
-           strings.Contains(content, "podAntiAffinity:") {
-            return true
-        }
-    }
-    return false
+	for _, content := range rendered {
+		if strings.Contains(content, "affinity:") &&
+			strings.Contains(content, "podAntiAffinity:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkResourceOptimization(resources []Resource, rendered map[string]string) bool {
-    // This would require more sophisticated analysis
-    // For now, we'll check if both requests and limits are set
-    return s.checkResourceLimits(resources, rendered) && 
-           s.checkResourceRequests(resources, rendered)
+	return s.checkResourceLimits(resources, rendered) &&
+		s.checkResourceRequests(resources, rendered)
 }
 
 func (s *Scanner) checkHPA(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "HorizontalPodAutoscaler" {
-            return true
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "HorizontalPodAutoscaler" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkImageLayers(resources []Resource, rendered map[string]string) bool {
-    // This would typically require image analysis
-    // For now, we'll assume it passes if we're not using latest tag
-    return s.checkImageScan(resources, rendered)
-}
+	// First check basic image scanning
+	if !s.checkImageScan(resources, rendered) {
+		return false
+	}
 
+	// Additional layer-specific checks
+	layerPatterns := []*regexp.Regexp{
+		regexp.MustCompile(`RUN\s+(apt-get|apk|yum)\s+install`), // Package installs
+		regexp.MustCompile(`COPY\s+.+\s+`),                      // File copies
+		regexp.MustCompile(`ADD\s+.+\s+`),                       // File additions
+	}
+
+	// Check for Dockerfile in templates (if present)
+	for path, content := range rendered {
+		if strings.HasSuffix(path, "Dockerfile") || strings.Contains(content, "FROM ") {
+			layerCount := 0
+			for _, pattern := range layerPatterns {
+				if pattern.MatchString(content) {
+					layerCount++
+				}
+			}
+			// Fail if too many layer-creating operations
+			if layerCount > 5 {
+				return false
+			}
+		}
+	}
+
+	return true
+}
 func (s *Scanner) checkCaching(resources []Resource, rendered map[string]string) bool {
-    // Check for volume mounts that could indicate caching
-    for _, content := range rendered {
-        if strings.Contains(content, "volumeMounts:") &&
-           (strings.Contains(content, "cache") ||
-            strings.Contains(content, "tmp")) {
-            return true
-        }
-    }
-    return false
+	// Check for volume mounts that could indicate caching
+	for _, content := range rendered {
+		if strings.Contains(content, "volumeMounts:") &&
+			(strings.Contains(content, "cache") ||
+				strings.Contains(content, "tmp")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkResourceQuotas(resources []Resource, rendered map[string]string) bool {
-    for _, resource := range resources {
-        if resource.Type == "ResourceQuota" {
-            return true
-        }
-    }
-    return false
+	for _, resource := range resources {
+		if resource.Type == "ResourceQuota" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkDocumentation(resources []Resource, rendered map[string]string) bool {
-    // Check for README or other documentation files
-    // This would need to check the actual chart files, not just rendered templates
-    // For now, we'll assume it's present
-    return true
+	// List of required documentation files
+	requiredFiles := []string{
+		"README.md",
+		"Chart.yaml",
+		"values.yaml",
+		"templates/NOTES.txt",
+	}
+
+	// List of recommended documentation files
+	recommendedFiles := []string{
+		"CHANGELOG.md",
+		"LICENSE",
+		"templates/_helpers.tpl",
+	}
+
+	// Count how many required files are present
+	requiredCount := 0
+	for _, file := range requiredFiles {
+		if _, err := os.Stat(filepath.Join(s.chartPath, file)); err == nil {
+			requiredCount++
+		}
+	}
+
+	// Count how many recommended files are present
+	recommendedCount := 0
+	for _, file := range recommendedFiles {
+		if _, err := os.Stat(filepath.Join(s.chartPath, file)); err == nil {
+			recommendedCount++
+		}
+	}
+
+	// Pass if we have all required files and at least half of recommended ones
+	return requiredCount == len(requiredFiles) && recommendedCount >= len(recommendedFiles)/2
 }
 
 func (s *Scanner) checkNamingConventions(resources []Resource, rendered map[string]string) bool {
-    // Check resource names follow conventions
-    for _, resource := range resources {
-        if !isValidResourceName(resource.Name) {
-            return false
-        }
-    }
-    return true
+	// Check resource names follow conventions
+	for _, resource := range resources {
+		if !isValidResourceName(resource.Name) {
+			return false
+		}
+	}
+	return true
 }
 
 func isValidResourceName(name string) bool {
-    // Simple validation - could be enhanced
-    return len(name) <= 253 && 
-           regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`).MatchString(name)
+	// Simple validation - could be enhanced
+	return len(name) <= 253 &&
+		regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`).MatchString(name)
 }
 
 func (s *Scanner) checkVersionPinning(resources []Resource, rendered map[string]string) bool {
-    // Check for version pinning in images
-    for _, content := range rendered {
-        if strings.Contains(content, "image:") && 
-           !strings.Contains(content, ":") {
-            return false
-        }
-    }
-    return true
+	// Check for version pinning in images
+	for _, content := range rendered {
+		if strings.Contains(content, "image:") &&
+			!strings.Contains(content, ":") {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Scanner) checkHelmHooks(resources []Resource, rendered map[string]string) bool {
-    // Check for proper use of Helm hooks
-    for _, content := range rendered {
-        if strings.Contains(content, "helm.sh/hook:") {
-            return true
-        }
-    }
-    return false
+	// Check for proper use of Helm hooks
+	for _, content := range rendered {
+		if strings.Contains(content, "helm.sh/hook:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Scanner) checkTemplateFunctions(resources []Resource, rendered map[string]string) bool {
-    // Check for proper use of template functions
-    // This would require more sophisticated analysis
-    // For now, we'll assume it passes
-    return true
-}
+	// Common template function issues to check for
+	badPatterns := []string{
+		`\{\{\s*\.Release\.Name\s*\}\}`,     // Missing quotes in selectors
+		`\{\{\s*\.Values\.([^\s.]+)\s*\}\}`, // Direct value references without defaults
+		`\{\{\s*if\s+not\s+`,                // Negated if conditions
+		`\{\{\s*-\s*`,                       // Whitespace control
+	}
 
+	// Good patterns we should look for
+	goodPatterns := []string{
+		`\{\{\s*default\s+`,  // Default values
+		`\{\{\s*include\s+`,  // Template includes
+		`\{\{\s*required\s+`, // Required values
+	}
+
+	badPatternCount := 0
+	goodPatternCount := 0
+
+	// Compile all patterns first
+	var badRegexps []*regexp.Regexp
+	for _, pattern := range badPatterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			continue // Skip invalid patterns
+		}
+		badRegexps = append(badRegexps, re)
+	}
+
+	var goodRegexps []*regexp.Regexp
+	for _, pattern := range goodPatterns {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			continue // Skip invalid patterns
+		}
+		goodRegexps = append(goodRegexps, re)
+	}
+
+	// Check all rendered templates
+	for _, content := range rendered {
+		for _, re := range badRegexps {
+			if re.MatchString(content) {
+				badPatternCount++
+			}
+		}
+		for _, re := range goodRegexps {
+			if re.MatchString(content) {
+				goodPatternCount++
+			}
+		}
+	}
+
+	// Pass if we found more good patterns than bad ones
+	return goodPatternCount > badPatternCount
+}
 
 func (s *Scanner) DownloadAndExtractChart(ctx context.Context, downloadURL string) (string, error) {
 	chartDir, err := os.MkdirTemp(s.tempDir, "chart-")
@@ -1128,4 +1358,3 @@ func extractTarGz(src, dst string) error {
 	}
 	return nil
 }
-//adding a comment 

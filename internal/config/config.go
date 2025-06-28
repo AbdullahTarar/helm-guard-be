@@ -6,7 +6,8 @@ import (
 
 type Config struct {
 	Server struct {
-		Address string
+		Address     string
+		FrontendURL string
 	}
 	GitHub struct {
 		ClientID     string
@@ -37,6 +38,8 @@ func Load() (*Config, error) {
 
 	// Security configuration
 	cfg.Security.CookieSecret = getEnv("COOKIE_SECRET", "default-secret-please-change")
+
+	cfg.Server.FrontendURL = getEnv("FRONTEND_URL", "http://localhost:3000")
 
 	return cfg, nil
 }
