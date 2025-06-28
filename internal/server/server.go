@@ -381,69 +381,86 @@ func (s *Server) handleGetUserRepos(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
 	state := uuid.New().String()
+	log.Printf("[AUTH] Starting OAuth flow with state: %s", state) // <-- Add this
 
 	session, err := s.store.Get(r, "helm-scanner-session")
 	if err != nil {
-		log.Printf("Error getting session: %v", err)
+		log.Printf("[AUTH ERROR] Session get failed: %v", err) // <-- Add this
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	session.Values["state"] = state
 	if err := session.Save(r, w); err != nil {
-		log.Printf("Error saving session: %v", err)
+		log.Printf("[AUTH ERROR] Session save failed: %v", err) // <-- Add this
 		http.Error(w, "Failed to save session", http.StatusInternalServerError)
 		return
 	}
 
 	authURL := s.github.GetAuthURL(state)
+	log.Printf("[AUTH] Redirecting to GitHub: %s", authURL) // <-- Add this
 	http.Redirect(w, r, authURL, http.StatusFound)
 }
 
 func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[AUTH] Received callback. Query params: %v", r.URL.Query()) // <-- Add this
+
 	session, err := s.store.Get(r, "helm-scanner-session")
 	if err != nil {
-		log.Printf("Error getting session: %v", err)
+		log.Printf("[AUTH ERROR] Session get failed: %v", err) // <-- Add this
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	storedState, ok := session.Values["state"].(string)
-	if !ok || r.URL.Query().Get("state") != storedState {
-		log.Println("Invalid or mismatched state")
+	if !ok {
+		log.Println("[AUTH ERROR] No state found in session") // <-- Add this
+		http.Error(w, "State missing", http.StatusBadRequest)
+		return
+	}
+
+	receivedState := r.URL.Query().Get("state")
+	if receivedState != storedState {
+		log.Printf("[AUTH ERROR] State mismatch. Stored: %s, Received: %s", storedState, receivedState) // <-- Add this
 		http.Error(w, "State mismatch", http.StatusBadRequest)
 		return
 	}
 
 	code := r.URL.Query().Get("code")
+	log.Printf("[AUTH] Exchanging code for token. Code: %s", code) // <-- Add this
+
 	token, err := s.github.ExchangeCode(r.Context(), code)
 	if err != nil {
-		log.Printf("Failed to exchange token: %v", err)
+		log.Printf("[AUTH ERROR] Token exchange failed: %v", err) // <-- Add this
 		http.Error(w, fmt.Sprintf("Failed to exchange token: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("[AUTH] Token received. Expires at: %v", token.Expiry) // <-- Add this
 	session.Values["github_token"] = token
 	session.Values["authenticated"] = true
 
 	if err := session.Save(r, w); err != nil {
-		log.Printf("Failed to save session: %v", err)
+		log.Printf("[AUTH ERROR] Session save failed: %v", err) // <-- Add this
 		http.Error(w, fmt.Sprintf("Failed to save session: %v", err), http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("[AUTH] Authentication successful. Redirecting to: %s", s.config.Server.FrontendURL+"/repositories") // <-- Add this
 	http.Redirect(w, r, s.config.Server.FrontendURL+"/repositories", http.StatusFound)
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	session, err := s.store.Get(r, "helm-scanner-session")
 	if err != nil {
-		log.Printf("Error getting session: %v", err)
+		log.Printf("[AUTH ERROR] Session get failed: %v", err) // <-- Add this
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	authenticated, _ := session.Values["authenticated"].(bool)
+	log.Printf("[AUTH] Auth status check. Authenticated: %v", authenticated) // <-- Add this
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{
 		"authenticated": authenticated,
