@@ -39,7 +39,7 @@ func Load() (*Config, error) {
 	// Security configuration
 	cfg.Security.CookieSecret = getEnv("COOKIE_SECRET", "default-secret-please-change")
 
-	cfg.Server.FrontendURL = getEnv("FRONTEND_URL", " ")
+	cfg.Server.FrontendURL = getEnv("FRONTEND_URL", "")
 
 	return cfg, nil
 }
