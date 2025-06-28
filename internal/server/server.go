@@ -48,9 +48,8 @@ func New(cfg *config.Config) (*Server, error) {
 		Path:     "/",
 		MaxAge:   86400 * 1, // 1 day
 		HttpOnly: true,
-		Secure:   false, // Set to true in production
+		Secure:   true, // Set to true in production
 		SameSite: http.SameSiteLaxMode,
-		Domain:   ".equationsquare.com",
 	}
 
 	// Initialize Helm scanner
@@ -88,10 +87,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) routes() {
 	s.router.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", s.config.Server.FrontendURL)
+			origin := r.Header.Get("Origin")
+			log.Printf("[CORS] Request from origin: %s", origin)
+
+			// Allow your frontend domains
+			allowedOrigins := []string{
+				s.config.Server.FrontendURL,
+				"https://helm-guard-fe.vercel.app", // Add your Vercel domain
+			}
+
+			for _, allowed := range allowedOrigins {
+				if origin == allowed {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					break
+				}
+			}
+
 			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
 			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
 
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -102,6 +117,26 @@ func (s *Server) routes() {
 		})
 	})
 
+	// // Add session debugging middleware
+	// s.router.Use(func(next http.Handler) http.Handler {
+	//     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	//         if strings.Contains(r.URL.Path, "/api/") {
+	//             session, err := s.store.Get(r, "helm-scanner-session")
+	//             if err != nil {
+	//                 log.Printf("[SESSION DEBUG] Failed to get session for %s: %v", r.URL.Path, err)
+	//             } else {
+	//                 log.Printf("[SESSION DEBUG] %s - IsNew: %v, Auth: %v, HasToken: %v",
+	//                     r.URL.Path,
+	//                     session.IsNew,
+	//                     session.Values["authenticated"],
+	//                     session.Values["github_token"] != nil)
+	//             }
+	//         }
+	//         next.ServeHTTP(w, r)
+	//     })
+	// })
+
+	// Your existing routes...
 	s.router.HandleFunc("/api/scan/public", s.handlePublicRepoScan).Methods("POST", "OPTIONS")
 	s.router.HandleFunc("/api/github/auth", s.handleGitHubAuth).Methods("GET")
 	s.router.HandleFunc("/api/github/callback", s.handleGitHubCallback).Methods("GET")
